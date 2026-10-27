@@ -1,11 +1,13 @@
 // camera.js — 摄像头实时预览与笔尖轨迹追踪
 // 流程：getUserMedia 预览 → rAF 连续帧采集（降采样至 320×240 处理）→
-//       笔尖检测（HSV 颜色追踪 / 运动差分兜底）→ 轨迹平滑 → 抬笔切分 → 回调笔画
+//       HSV 颜色追踪（需先采样笔色）→ 轨迹平滑/跳变保护 → 抬笔切分 → 回调笔画
+// 注：未采样笔色时不做任何追踪，避免自动对焦/噪点/晃动产生的运动噪声乱画
 
 const PW = 320, PH = 240;      // 处理分辨率
 const LIFT_FRAMES = 5;         // 连续丢帧数视为抬笔（约 160ms @30fps）
 const MIN_STROKE_PTS = 4;      // 少于该点数视为噪声
 const MIN_PIX = 3;             // 匹配像素数下限
+const JUMP_DIST = PW * 0.35;   // 帧间质心瞬移阈值：超过视为重新落笔（不画飞线）
 
 export class CameraCapture {
   constructor(video, overlay, opts) {
@@ -22,9 +24,8 @@ export class CameraCapture {
     this.smooth = null;        // 平滑后的笔尖
     this.frameMs = 0;
     this.fps = 0;
+    this.jump = false;          // 本帧质心是否瞬移（重新落笔）
     this._fpsT = performance.now(); this._fpsC = 0;
-    this._prevGray = null;
-    this._motionWarned = false;
     this._proc = document.createElement('canvas');
     this._proc.width = PW; this._proc.height = PH;
     this._pctx = this._proc.getContext('2d', { willReadFrequently: true });
@@ -51,7 +52,7 @@ export class CameraCapture {
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
     this.video.srcObject = null;
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
-    this.trail = []; this.smooth = null; this._prevGray = null;
+    this.trail = []; this.smooth = null; this.jump = false;
   }
 
   // 取景框：视频中央正方形（与 CSS .cam-guide 对应），映射到 1024×1024
@@ -104,6 +105,12 @@ export class CameraCapture {
     const { data } = this._grab();
     const tip = this._findTip(data);
     if (tip) {
+      if (this.jump) {
+        // 质心瞬移：先提交已写笔画，再重新落笔，避免两位置间画出飞线
+        if (this.trail.length >= MIN_STROKE_PTS) this.h.onStrokeEnd(this._commitTrail());
+        this.trail = [];
+        this.jump = false;
+      }
       const p = this.to1024(tip.x * (this.overlay.width / PW), tip.y * (this.overlay.height / PH));
       this.trail.push([tip.x, tip.y]);
       this.lostFrames = 0;
@@ -112,12 +119,7 @@ export class CameraCapture {
       this.lostFrames++;
       if (this.lostFrames === LIFT_FRAMES && this.trail.length >= MIN_STROKE_PTS) {
         // 抬笔：结束当前笔画
-        const pts = this.trail.map(([x, y]) => {
-          const q = this.to1024(x * (this.overlay.width / PW), y * (this.overlay.height / PH));
-          return [q[0], q[1], performance.now()];
-        });
-        this.h.onStrokeEnd(pts);
-        this.trail = [];
+        this.h.onStrokeEnd(this._commitTrail());
       } else if (this.lostFrames > LIFT_FRAMES) {
         this.trail = [];
       }
@@ -125,39 +127,46 @@ export class CameraCapture {
     this._drawOverlay(tip);
   }
 
+  // 将当前轨迹转换为 1024×1024 书写坐标并清空轨迹
+  _commitTrail() {
+    const pts = this.trail.map(([x, y]) => {
+      const q = this.to1024(x * (this.overlay.width / PW), y * (this.overlay.height / PH));
+      return [q[0], q[1], performance.now()];
+    });
+    this.trail = [];
+    return pts;
+  }
+
   _grab() {
     this._pctx.drawImage(this.video, 0, 0, PW, PH);
     return this._pctx.getImageData(0, 0, PW, PH);
   }
 
-  // 笔尖检测：优先颜色追踪；未取色时使用帧间运动差分（会提示建议取色）
+  // 笔尖检测：HSV 颜色追踪（必须先采样笔色）。未取色时一律返回 null，
+  // 杜绝把自动对焦/曝光波动/噪点/晃动当作笔尖运动的乱画问题。
   _findTip(data) {
-    let cx = 0, cy = 0, cnt = 0;
     const tgt = this.targetColor;
-    let prev = this._prevGray;
-    const useMotion = !tgt;
-    if (useMotion && !this._motionWarned) {
-      this._motionWarned = true;
-      this.h.onStatus('未取笔色，当前使用运动追踪（建议点击「取笔色」后点按笔尖）');
-    }
-    const gray = new Float32Array(PW * PH);
+    if (!tgt) { this.smooth = null; return null; }
+    let cx = 0, cy = 0, cnt = 0;
     for (let i = 0, px = 0; px < PW * PH; px++, i += 4) {
       const r = data[i], g = data[i + 1], b = data[i + 2];
-      gray[px] = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
-      if (tgt) {
-        if (matchColor(r, g, b, tgt)) { cx += px % PW; cy += (px / PW) | 0; cnt++; }
-      } else if (prev) {
-        if (Math.abs(gray[px] - prev[px]) > 0.09) { cx += px % PW; cy += (px / PW) | 0; cnt++; }
-      }
+      if (matchColor(r, g, b, tgt)) { cx += px % PW; cy += (px / PW) | 0; cnt++; }
     }
-    this._prevGray = gray;
     if (cnt < MIN_PIX) {
       this.smooth = null;
       return null;
     }
-    let x = cx / cnt, y = cy / cnt;
-    // 指数平滑，抑制单帧抖动
-    this.smooth = this.smooth ? [this.smooth[0] + 0.45 * (x - this.smooth[0]), this.smooth[1] + 0.45 * (y - this.smooth[1])] : [x, y];
+    const x = cx / cnt, y = cy / cnt;
+    if (this.smooth && Math.hypot(x - this.smooth[0], y - this.smooth[1]) > JUMP_DIST) {
+      // 帧间瞬移：重置平滑状态并标记跳变，由 _processFrame 重开笔画
+      this.jump = true;
+      this.smooth = [x, y];
+    } else {
+      // 指数平滑，抑制单帧抖动
+      this.smooth = this.smooth
+        ? [this.smooth[0] + 0.45 * (x - this.smooth[0]), this.smooth[1] + 0.45 * (y - this.smooth[1])]
+        : [x, y];
+    }
     return { x: this.smooth[0], y: this.smooth[1] };
   }
 
