@@ -1,25 +1,33 @@
-// camera.js — 摄像头实时预览与笔迹自动识别
-// 原理：开启后自动锁定纸面背景（画面稳定时拍照记忆灰度），
-//       之后每帧与背景对比：新出现且持续变暗的区域 = 书写墨迹的生长前沿，
+// camera.js — 摄像头实时预览与笔迹自动识别 v5
+// 原理：开启后自动锁定纸面背景（取景框内画面稳定后记忆灰度），
+//       之后每帧在【取景框内】与背景对比：新出现且持续变暗的区域 = 书写墨迹的生长前沿，
 //       其质心即笔尖。黑笔/铅笔/红笔等在白纸上书写均可识别，无需手动取色。
-// 防干扰：新增面积过小(噪点)/过大(手影、纸张移动)/暗化不足(阴影)一律忽略。
+// v5 关键改进（针对真机手持/抖动/阴影干扰）：
+//   1) 处理分辨率随视频方向自适应（横屏/竖屏都保持等比，不压扁笔画形态）
+//   2) 视频容器、覆盖层、取景框三者像素级对齐（红色轨迹与实际笔画不再错位）
+//   3) 仅识别取景框内的墨迹：框外的手影/笔杆/环境晃动一律忽略
+//   4) 书写中新增墨迹必须紧邻上一笔尖（笔画是连续生长的），
+//      远处孤立暗斑（阴影/抖动）不再拉动轨迹
+//   5) 落笔需连续多帧稳定确认才起笔，误动/瞬时阴影不再触发书写
 
-const PW = 320, PH = 240;       // 处理分辨率
-const LIFT_FRAMES = 8;           // 连续无新增墨迹帧数视为抬笔（约 260ms @30fps）
+const PROC_W = 320;             // 处理宽度基准（按视频长宽比等比缩放）
+const PROC_H_MAX = 480;         // 处理高度上限（竖屏视频）
+const LIFT_FRAMES = 8;           // 连续无新增墨迹帧数视为抬笔
 const MIN_STROKE_PTS = 4;       // 少于该点数视为噪声
-const JUMP_DIST = PW * 0.35;     // 帧间质心瞬移阈值：超过视为重新落笔（不画飞线）
 const MIN_PIX = 6;               // 新增墨迹面积下限（像素）
 const MAX_PIX = 2000;            // 新增墨迹面积上限（超过视为阴影/纸张移动）
 const INK_DIFF = 0.16;           // 比背景暗多少算墨迹
 const INK_MAX_GRAY = 0.62;       // 墨迹亮度上限（更亮的区域视为阴影/纸面）
-const TIP_STRONG = 0.26;         // 新增区域平均暗化强度下限（滤阴影边缘）
-const ASPECT_MAX = 4;            // 新增区域长宽比上限：细长条=移动的影子/笔杆影像，丢弃
-const CONFIRM_FRAMES = 4;        // 像素连续存在帧数 → 确认为真墨迹（墨迹是持久的，影子扫过不持久）
-const ARM_CONFIRM = 2;           // 落笔确认次数：新增质心连续稳定才正式起笔（防抖动/瞬时误报）
-const ARM_RADIUS = 48;           // 落笔确认半径（视频像素）
+const TIP_STRONG = 0.28;         // 新增区域平均暗化强度下限（滤阴影边缘）
+const ASPECT_MAX = 6;            // 新增区域长宽比上限：细长条=移动的影子/笔杆影像，丢弃
+const CONFIRM_FRAMES = 5;        // 像素连续存在帧数 → 确认为真墨迹（墨迹持久，影子扫过不持久）
+const ARM_CONFIRM = 3;           // 落笔确认次数：新增质心连续稳定才正式起笔
+const ARM_RADIUS = 44;           // 落笔确认半径（处理像素）
+const GROW_RADIUS = 44;          // 书写中新增墨迹距上一笔尖的最大距离：超出=远处干扰，忽略
 const VANISH_WARN = 120;         // 已确认墨迹单帧消失量：超过=光照突变/遮挡，丢帧
-const LEARN_STABLE_FRAMES = 5;   // 画面连续稳定帧数 → 锁定背景
+const LEARN_STABLE_FRAMES = 5;   // 取景框内画面连续稳定帧数 → 锁定背景
 const LEARN_TIMEOUT_MS = 6000;   // 最长学习时间（超时强制锁定）
+const ROI_MARGIN = 0.04;         // 识别区域相对取景框的内缩比例
 
 export class CameraCapture {
   constructor(video, overlay, opts) {
@@ -30,7 +38,11 @@ export class CameraCapture {
     this.h = opts; // { onTip(x,y), onStrokeEnd(points), onStatus(text) }
     this.running = false;
     this.stream = null;
-    this.trail = [];           // 当前笔画点（视频像素坐标）
+    this.pw = 320; this.ph = 240;  // 处理分辨率（start 时按视频长宽比自适应）
+    this.jumpDist = 112;             // 帧间质心瞬移阈值（处理像素）
+    this.roi = { x0: 0, y0: 0, x1: 320, y1: 240 };
+    this.roiArea = 320 * 240;
+    this.trail = [];           // 当前笔画点（处理像素坐标）
     this.lostFrames = 0;
     this.smooth = null;        // 平滑后的笔尖
     this.jump = false;         // 本帧质心是否瞬移（重新落笔）
@@ -49,7 +61,7 @@ export class CameraCapture {
     this.fps = 0;
     this._fpsT = performance.now(); this._fpsC = 0;
     this._proc = document.createElement('canvas');
-    this._proc.width = PW; this._proc.height = PH;
+    this._proc.width = this.pw; this._proc.height = this.ph;
     this._pctx = this._proc.getContext('2d', { willReadFrequently: true });
   }
 
@@ -61,10 +73,18 @@ export class CameraCapture {
     });
     this.video.srcObject = this.stream;
     await this.video.play();
-    // 覆盖层尺寸对齐视频像素
-    this.overlay.width = this.video.videoWidth || 1280;
-    this.overlay.height = this.video.videoHeight || 720;
+    if (!this.video.videoWidth) {
+      await new Promise(r => this.video.addEventListener('loadedmetadata', r, { once: true }));
+    }
+    const vw = this.video.videoWidth || 1280, vh = this.video.videoHeight || 720;
+    // 覆盖层尺寸 = 视频原始像素；容器宽高比 = 视频宽高比 → 三者像素级对齐
+    this.overlay.width = vw;
+    this.overlay.height = vh;
+    const wrap = this.video.parentElement;
+    if (wrap) wrap.style.aspectRatio = `${vw} / ${vh}`;
     this.guide = this._guideRect(); // 取景框（映射到 1024×1024 书写坐标系）
+    this._layoutGuideDom();
+    this._setupProc(vw, vh);
     this.running = true;
     this._beginLearn();          // 自动锁定纸面背景
     this._loop();
@@ -99,11 +119,42 @@ export class CameraCapture {
     this.h.onStatus('正在锁定纸面背景 · 请移开手，保持纸面稳定…');
   }
 
-  // 取景框：视频中央正方形（与 CSS .cam-guide 对应），映射到 1024×1024
+  // 取景框：视频中央正方形，映射到 1024×1024 书写坐标系
   _guideRect() {
     const vw = this.overlay.width, vh = this.overlay.height;
     const side = Math.min(vw, vh) * 0.85;
     return { x: (vw - side) / 2, y: (vh - side) / 2, side, vw, vh };
+  }
+
+  // 取景框 DOM 与识别 ROI 对齐（覆盖层与视频像素一一对应，百分比定位即可）
+  _layoutGuideDom() {
+    const gd = document.getElementById('cam-guide');
+    if (!gd || !this.guide) return;
+    const { x, y, side, vw, vh } = this.guide;
+    gd.style.left = (x / vw * 100) + '%';
+    gd.style.top = (y / vh * 100) + '%';
+    gd.style.width = (side / vw * 100) + '%';
+    gd.style.height = (side / vh * 100) + '%';
+  }
+
+  // 处理分辨率按视频长宽比等比自适应；取景框 → 处理坐标 ROI
+  _setupProc(vw, vh) {
+    let pw = PROC_W;
+    let ph = Math.round(PROC_W * vh / vw);
+    if (ph > PROC_H_MAX) { const k = PROC_H_MAX / ph; ph = PROC_H_MAX; pw = Math.max(160, Math.round(pw * k)); }
+    if (ph < 100) { const k = 100 / ph; ph = 100; pw = Math.round(pw * k); }
+    this.pw = pw; this.ph = ph;
+    this._proc.width = pw; this._proc.height = ph;
+    this.jumpDist = Math.round(pw * 0.35);
+    const g = this.guide, s = pw / vw;
+    const m = Math.max(2, Math.round(g.side * s * ROI_MARGIN));
+    this.roi = {
+      x0: Math.max(0, Math.ceil(g.x * s) + m),
+      y0: Math.max(0, Math.ceil(g.y * s) + m),
+      x1: Math.min(pw, Math.floor((g.x + g.side) * s) - m),
+      y1: Math.min(ph, Math.floor((g.y + g.side) * s) - m)
+    };
+    this.roiArea = Math.max(1, (this.roi.x1 - this.roi.x0) * (this.roi.y1 - this.roi.y0));
   }
 
   to1024(px, py) {
@@ -142,7 +193,7 @@ export class CameraCapture {
         this.jump = false;
         this.armed = true; this.candidate = null; this.confirmCount = 0;
       }
-      const p = this.to1024(tip.x * (this.overlay.width / PW), tip.y * (this.overlay.height / PH));
+      const p = this.to1024(tip.x * (this.overlay.width / this.pw), tip.y * (this.overlay.height / this.ph));
       this.trail.push([tip.x, tip.y]);
       this.lostFrames = 0;
       this.h.onTip(p[0], p[1]);
@@ -162,7 +213,7 @@ export class CameraCapture {
   // 将当前轨迹转换为 1024×1024 书写坐标并清空轨迹
   _commitTrail() {
     const pts = this.trail.map(([x, y]) => {
-      const q = this.to1024(x * (this.overlay.width / PW), y * (this.overlay.height / PH));
+      const q = this.to1024(x * (this.overlay.width / this.pw), y * (this.overlay.height / this.ph));
       return [q[0], q[1], performance.now()];
     });
     this.trail = [];
@@ -170,55 +221,65 @@ export class CameraCapture {
   }
 
   _grab() {
-    this._pctx.drawImage(this.video, 0, 0, PW, PH);
-    return this._pctx.getImageData(0, 0, PW, PH);
+    this._pctx.drawImage(this.video, 0, 0, this.pw, this.ph);
+    return this._pctx.getImageData(0, 0, this.pw, this.ph);
   }
 
   // 笔迹识别状态机：
-  //   learning — 检测画面稳定性，稳定后拍下背景灰度
-  //   ready    — 每帧找出「新增墨迹」(本帧墨迹且上帧不是墨迹)，质心即笔尖
+  //   learning — 检测【取景框内】画面稳定性（框外的手/环境晃动不影响锁定），稳定后记忆背景
+  //   ready    — 每帧在取景框内找出「新增墨迹」(本帧确认且上帧未确认)，质心即笔尖
   _findTip(data) {
-    const gray = new Float32Array(PW * PH);
-    for (let i = 0, px = 0; px < PW * PH; px++, i += 4) {
+    const pw = this.pw, ph = this.ph, N = pw * ph;
+    const gray = new Float32Array(N);
+    for (let i = 0, px = 0; px < N; px++, i += 4) {
       gray[px] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) / 255;
     }
+
+    const { x0, y0, x1, y1 } = this.roi;
 
     if (this.phase === 'learning') {
       let changed = 0;
       if (this._prevLearnGray) {
-        for (let px = 0; px < gray.length; px++) {
-          if (Math.abs(gray[px] - this._prevLearnGray[px]) > 0.12) changed++;
+        for (let py = y0; py < y1; py++) {
+          const row = py * pw;
+          for (let px = x0; px < x1; px++) {
+            if (Math.abs(gray[row + px] - this._prevLearnGray[row + px]) > 0.12) changed++;
+          }
         }
       }
       this._prevLearnGray = gray;
-      this._stableCount = (this._prevLearnGray && changed < PW * PH * 0.008) ? this._stableCount + 1 : 0;
+      this._stableCount = (this._prevLearnGray && changed < this.roiArea * 0.008) ? this._stableCount + 1 : 0;
       if (this._stableCount >= LEARN_STABLE_FRAMES || performance.now() - this._learnStart > LEARN_TIMEOUT_MS) {
         this.bg = gray; this.age = null; this.prevConfirmed = null;
         this.armed = true; this.candidate = null; this.confirmCount = 0;
         this.phase = 'ready';
-        this.h.onStatus('背景已锁定 · 请直接书写，墨迹自动识别');
+        this.h.onStatus('背景已锁定 · 请在虚线取景框内书写，墨迹自动识别');
       }
       return null;
     }
 
     if (this.phase !== 'ready' || !this.bg) { this.smooth = null; return null; }
 
-    // pass 1：瞬时墨迹 → 连续存在 CONFIRM_FRAMES 帧的像素确认为真墨迹。
-    // 墨迹是持久附着在纸上的；手影扫过、笔杆晃过、遮挡只持续几帧，不会确认。
-    if (!this.age) this.age = new Uint16Array(PW * PH);
-    const confirmed = new Uint8Array(PW * PH);
+    // pass 1：取景框内瞬时墨迹 → 连续存在 CONFIRM_FRAMES 帧的像素确认为真墨迹。
+    // 墨迹持久附着在纸上；手影扫过、笔杆晃过、遮挡只持续几帧，不会确认。
+    if (!this.age) this.age = new Uint16Array(N);
+    const confirmed = new Uint8Array(N);
     let confirmedCount = 0;
-    for (let px = 0; px < gray.length; px++) {
-      const d = this.bg[px] - gray[px];
-      if (d > INK_DIFF && gray[px] < INK_MAX_GRAY) {
-        this.age[px] = this.age[px] < CONFIRM_FRAMES ? this.age[px] + 1 : CONFIRM_FRAMES;
-      } else {
-        this.age[px] = 0;
+    for (let py = y0; py < y1; py++) {
+      const row = py * pw;
+      for (let px = x0; px < x1; px++) {
+        const idx = row + px;
+        const d = this.bg[idx] - gray[idx];
+        if (d > INK_DIFF && gray[idx] < INK_MAX_GRAY) {
+          this.age[idx] = this.age[idx] < CONFIRM_FRAMES ? this.age[idx] + 1 : CONFIRM_FRAMES;
+        } else {
+          this.age[idx] = 0;
+        }
+        if (this.age[idx] >= CONFIRM_FRAMES) { confirmed[idx] = 1; confirmedCount++; }
       }
-      if (this.age[px] >= CONFIRM_FRAMES) { confirmed[px] = 1; confirmedCount++; }
     }
-    if (confirmedCount > PW * PH * 0.30) {
-      // 画面大面积变化：纸张移动/遮挡 → 提示重校准，本帧不识别
+    if (confirmedCount > this.roiArea * 0.30) {
+      // 取景框内大面积变化：纸张移动/遮挡 → 提示重校准，本帧不识别
       this.h.onStatus('画面变化过大 · 请点「重新校准」');
       this.smooth = null; this.prevConfirmed = confirmed; this.prevConfirmedCount = confirmedCount;
       return null;
@@ -228,35 +289,78 @@ export class CameraCapture {
       this.smooth = null; this.prevConfirmed = confirmed; this.prevConfirmedCount = confirmedCount;
       return null;
     }
-    // pass 2：新增确认墨迹（正在生长的笔画前沿）= 本帧确认 − 上帧确认
-    let cx = 0, cy = 0, cnt = 0, sumd = 0;
-    let minx = PW, maxx = 0, miny = PH, maxy = 0;
-    if (this.prevConfirmed) {
-      for (let py = 0; py < PH; py++) {
-        const row = py * PW;
-        for (let px = 0; px < PW; px++) {
+    // pass 2：收集新增确认墨迹像素（正在生长的笔画前沿）= 本帧确认 − 上帧确认
+    const prev = this.prevConfirmed;
+    const newIdx = [];
+    if (prev) {
+      for (let py = y0; py < y1; py++) {
+        const row = py * pw;
+        for (let px = x0; px < x1; px++) {
           const idx = row + px;
-          if (confirmed[idx] && !this.prevConfirmed[idx]) {
-            cx += px; cy += py; cnt++;
-            sumd += this.bg[idx] - gray[idx];
-            if (px < minx) minx = px; if (px > maxx) maxx = px;
-            if (py < miny) miny = py; if (py > maxy) maxy = py;
-          }
+          if (confirmed[idx] && !prev[idx]) newIdx.push(idx);
         }
       }
     }
     this.prevConfirmed = confirmed; this.prevConfirmedCount = confirmedCount;
-    if (cnt < MIN_PIX || cnt > MAX_PIX || sumd / cnt < TIP_STRONG) {
-      this.smooth = null;
+    if (!newIdx.length) { this.smooth = null; return null; }
+
+    // 连通域分离：同帧内可能存在多处新增暗区（真实笔画前沿 + 手影/抖动干扰），
+    // 必须分离后只跟踪真实前沿，否则质心混合会把轨迹拉偏。
+    if (!this._label || this._label.length !== N) {
+      this._label = new Int32Array(N); this._queue = new Int32Array(N); this._gen = 0;
+    }
+    this._gen++;
+    const gen = this._gen, label = this._label, queue = this._queue;
+    const comps = [];
+    for (const s of newIdx) {
+      if (label[s] === gen) continue;
+      const st = { cnt: 0, sumd: 0, cx: 0, cy: 0, minx: pw, maxx: 0, miny: ph, maxy: 0 };
+      let head = 0, tail = 0;
+      queue[tail++] = s; label[s] = gen;
+      while (head < tail) {
+        const idx = queue[head++];
+        const px = idx % pw, py = (idx - px) / pw;
+        st.cnt++; st.cx += px; st.cy += py;
+        st.sumd += this.bg[idx] - gray[idx];
+        if (px < st.minx) st.minx = px; if (px > st.maxx) st.maxx = px;
+        if (py < st.miny) st.miny = py; if (py > st.maxy) st.maxy = py;
+        // 4 邻接扩散（仍在「新增确认墨迹」集合内才入队）
+        if (px > 0 && label[idx - 1] !== gen && confirmed[idx - 1] && !prev[idx - 1]) { label[idx - 1] = gen; queue[tail++] = idx - 1; }
+        if (px < pw - 1 && label[idx + 1] !== gen && confirmed[idx + 1] && !prev[idx + 1]) { label[idx + 1] = gen; queue[tail++] = idx + 1; }
+        if (py > 0 && label[idx - pw] !== gen && confirmed[idx - pw] && !prev[idx - pw]) { label[idx - pw] = gen; queue[tail++] = idx - pw; }
+        if (py < ph - 1 && label[idx + pw] !== gen && confirmed[idx + pw] && !prev[idx + pw]) { label[idx + pw] = gen; queue[tail++] = idx + pw; }
+      }
+      st.cx /= st.cnt; st.cy /= st.cnt;
+      comps.push(st);
+    }
+
+    // 连通域选择：
+    //   书写中 → 取距上一笔尖最近的连通域（笔画是从笔尖连续生长的）
+    //   待落笔 → 取面积最大的连通域（真实落笔墨池 > 噪点闪烁）
+    let pick = null;
+    if (!this.armed && this.smooth) {
+      let bd = Infinity;
+      for (const c of comps) {
+        const d = Math.hypot(c.cx - this.smooth[0], c.cy - this.smooth[1]);
+        if (d < bd) { bd = d; pick = c; }
+      }
+    } else {
+      for (const c of comps) if (!pick || c.cnt > pick.cnt) pick = c;
+    }
+    if (!pick) { this.smooth = null; return null; }
+
+    const failKeep = () => { if (this.armed || !this.smooth) this.smooth = null; };
+    if (pick.cnt < MIN_PIX || pick.cnt > MAX_PIX || pick.sumd / pick.cnt < TIP_STRONG) {
+      failKeep();   // 书写中保留锚点，仅跳过本帧（维持连续性校验的基准）
       return null;
     }
     // 形态过滤：细长条的新增区域 = 移动的影子/笔杆影像，丢弃
-    const bw = maxx - minx + 1, bh = maxy - miny + 1;
+    const bw = pick.maxx - pick.minx + 1, bh = pick.maxy - pick.miny + 1;
     if (Math.max(bw, bh) / Math.max(1, Math.min(bw, bh)) > ASPECT_MAX) {
-      this.smooth = null;
+      failKeep();
       return null;
     }
-    const x = cx / cnt, y = cy / cnt;
+    const x = pick.cx, y = pick.cy;
     // 落笔确认：新位置需连续 ARM_CONFIRM 帧稳定出现才正式起笔（防抖动/瞬时误报）
     if (this.armed) {
       if (this.candidate && Math.hypot(x - this.candidate[0], y - this.candidate[1]) < ARM_RADIUS) {
@@ -270,15 +374,19 @@ export class CameraCapture {
       this.smooth = this.candidate;   // 从候选位置起笔
       return { x: this.smooth[0], y: this.smooth[1] };
     }
-    if (this.smooth && Math.hypot(x - this.smooth[0], y - this.smooth[1]) > JUMP_DIST) {
+    if (!this.smooth) { this.smooth = [x, y]; return { x, y }; }  // 恢复锚点
+    const d = Math.hypot(x - this.smooth[0], y - this.smooth[1]);
+    if (d > this.jumpDist) {
       // 帧间瞬移：重置平滑状态并标记跳变，由 _processFrame 重开笔画
       this.jump = true;
       this.smooth = [x, y];
+    } else if (d > GROW_RADIUS) {
+      // 连续性校验：书写中笔画从上一笔尖连续生长；
+      // 远处孤立暗斑（阴影/抖动）忽略，本帧不移动笔尖
+      return null;
     } else {
       // 指数平滑，抑制单帧抖动
-      this.smooth = this.smooth
-        ? [this.smooth[0] + 0.45 * (x - this.smooth[0]), this.smooth[1] + 0.45 * (y - this.smooth[1])]
-        : [x, y];
+      this.smooth = [this.smooth[0] + 0.45 * (x - this.smooth[0]), this.smooth[1] + 0.45 * (y - this.smooth[1])];
     }
     return { x: this.smooth[0], y: this.smooth[1] };
   }
@@ -286,13 +394,24 @@ export class CameraCapture {
   _drawOverlay(tip) {
     const c = this.octx, W = this.overlay.width, H = this.overlay.height;
     c.clearRect(0, 0, W, H);
+    // 取景框外轻微压暗，突出识别区域
+    if (this.running && this.phase === 'ready') {
+      const g = this.guide;
+      c.save();
+      c.fillStyle = 'rgba(0,0,0,.18)';
+      c.fillRect(0, 0, g.x, H);
+      c.fillRect(g.x + g.side, 0, W - g.x - g.side, H);
+      c.fillRect(g.x, 0, g.side, g.y);
+      c.fillRect(g.x, g.y + g.side, g.side, H - g.y - g.side);
+      c.restore();
+    }
     // 已成轨迹
     if (this.trail.length > 1) {
       c.strokeStyle = 'rgba(255,80,80,.9)';
       c.lineWidth = Math.max(2, W / 240);
       c.beginPath();
-      c.moveTo(this.trail[0][0] * (W / PW), this.trail[0][1] * (H / PH));
-      for (let i = 1; i < this.trail.length; i++) c.lineTo(this.trail[i][0] * (W / PW), this.trail[i][1] * (H / PH));
+      c.moveTo(this.trail[0][0] * (W / this.pw), this.trail[0][1] * (H / this.ph));
+      for (let i = 1; i < this.trail.length; i++) c.lineTo(this.trail[i][0] * (W / this.pw), this.trail[i][1] * (H / this.ph));
       c.stroke();
     }
     if (tip) {
@@ -300,7 +419,7 @@ export class CameraCapture {
       c.strokeStyle = '#00e676';
       c.lineWidth = 3;
       c.beginPath();
-      c.arc(tip.x * (W / PW), tip.y * (H / PH), r, 0, Math.PI * 2);
+      c.arc(tip.x * (W / this.pw), tip.y * (H / this.ph), r, 0, Math.PI * 2);
       c.stroke();
     }
   }

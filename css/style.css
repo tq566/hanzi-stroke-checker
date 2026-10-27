@@ -72,12 +72,13 @@ body { max-width: 560px; margin: 0 auto; padding-bottom: 40px; }
 .btn.tiny { flex: 0; padding: 7px 10px; font-size: 13px; }
 
 /* ---------- 摄像头 ---------- */
+/* 容器宽高比在摄像头启动后由 JS 设为视频实际比例，保证画面/覆盖层/取景框像素级对齐 */
 .video-wrap { position: relative; width: 100%; background: #101418; border-radius: 12px; overflow: hidden; aspect-ratio: 4/3; }
-.video-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.video-wrap video { width: 100%; height: 100%; object-fit: fill; display: block; }
 .video-wrap canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+/* 取景框的位置与尺寸由 camera.js 按视频坐标定位（与识别区域严格一致） */
 .cam-guide {
-  position: absolute; left: 7.5%; top: 6%; width: 85%; aspect-ratio: 1/1;
-  border: 2px dashed rgba(255,255,255,.75); border-radius: 8px; pointer-events: none;
+  position: absolute; border: 2px dashed rgba(255,255,255,.85); border-radius: 8px; pointer-events: none;
 }
 .cam-status {
   position: absolute; left: 0; right: 0; bottom: 0; padding: 5px 10px;

@@ -2,9 +2,20 @@
 // 数据由 tools/build_db.js 从 Make Me a Hanzi（ARPHIC PL 授权）生成：
 //   data/meta.json      { total: 覆盖字数 }
 //   data/chunks/XX.json  按 Unicode 码点高 2 位分块（写什么字才下载对应分块）
-//   条目格式 { "s": 轮廓path[1024坐标系,y向下], "mc": 每笔点数, "m": 打平中轴线坐标 }
+//   条目格式 { "s": 轮廓path[原始900网格,y向上], "mc": 每笔点数, "m": 打平中轴线坐标 }
+// Make Me a Hanzi 原始数据为 y 轴向上（y=900 是字的顶部），而画布是 y 轴向下。
+// 加载时统一转换为 1024 画布坐标：x' = x+62（水平居中），y' = 962-y（翻转后居中）。
 
 import { resample, bboxOf } from './geometry.js';
+
+const MM_OFF = 62;    // 900 网格 → 1024 画布的居中偏移：(1024-900)/2
+const MM_FLIP = 962;  // y 翻转：900+62
+
+// 轮廓路径仅含 M/Q/L/C（均为偶数个绝对坐标参数），按坐标对整体变换
+function xformPath(d) {
+  return d.replace(/(-?[\d.]+)[ ,]+(-?[\d.]+)/g,
+    (_, a, b) => `${Math.round(+a + MM_OFF)} ${Math.round(MM_FLIP - +b)}`);
+}
 
 let total = 0;
 let metaPromise = null;
@@ -55,7 +66,7 @@ export async function getEntry(ch) {
   let off = 0;
   for (const cnt of raw.mc) {
     const pts = [];
-    for (let i = 0; i < cnt * 2; i += 2) pts.push([raw.m[off + i], raw.m[off + i + 1]]);
+    for (let i = 0; i < cnt * 2; i += 2) pts.push([raw.m[off + i] + MM_OFF, MM_FLIP - raw.m[off + i + 1]]);
     off += cnt * 2;
     medians.push(pts);
   }
@@ -70,7 +81,7 @@ export async function getEntry(ch) {
   }
   const entry = {
     ch,
-    strokes: raw.s,
+    strokes: raw.s.map(xformPath),   // 轮廓路径同步变换为 y 向下画布坐标
     medians,
     medRes: medians.map(m => resample(m, 32)),
     bbox: { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2 },

@@ -16,11 +16,12 @@ for (const f of readdirSync(chunkDir)) {
 function getEntry(ch) {
   const raw = db[ch];
   if (!raw) return null;
+  // 与 js/db.js 保持一致：Make Me a Hanzi 原始 y 向上 → 画布 y 向下 1024（x+62, 962-y）
   const medians = [];
   let off = 0;
   for (const cnt of raw.mc) {
     const pts = [];
-    for (let i = 0; i < cnt * 2; i += 2) pts.push([raw.m[off + i], raw.m[off + i + 1]]);
+    for (let i = 0; i < cnt * 2; i += 2) pts.push([raw.m[off + i] + 62, 962 - raw.m[off + i + 1]]);
     off += cnt * 2;
     medians.push(pts);
   }
