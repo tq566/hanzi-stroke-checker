@@ -14,9 +14,10 @@ export class TouchCapture {
 
   toLocal(e) {
     const r = this.canvas.getBoundingClientRect();
+    // 钳制在 0..1024：手指滑出画布边缘时不产生越界坐标
     return [
-      (e.clientX - r.left) / r.width * 1024,
-      (e.clientY - r.top) / r.height * 1024
+      Math.max(0, Math.min(1024, (e.clientX - r.left) / r.width * 1024)),
+      Math.max(0, Math.min(1024, (e.clientY - r.top) / r.height * 1024))
     ];
   }
 
@@ -36,7 +37,9 @@ export class TouchCapture {
     cv.addEventListener('pointermove', e => {
       if (!this.drawing || e.pointerId !== this.pointerId) return;
       e.preventDefault();
-      const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+      // 部分环境 getCoalescedEvents() 可能返回空数组（如合成/未合并事件），回退到当前事件
+      const evs0 = e.getCoalescedEvents ? e.getCoalescedEvents() : null;
+      const evs = (evs0 && evs0.length) ? evs0 : [e];
       const last = this.points[this.points.length - 1];
       for (const ev of evs) {
         const [x, y] = this.toLocal(ev);

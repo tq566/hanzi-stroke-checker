@@ -262,9 +262,13 @@ export class CameraCapture {
 
     // pass 1：取景框内瞬时墨迹 → 连续存在 CONFIRM_FRAMES 帧的像素确认为真墨迹。
     // 墨迹持久附着在纸上；手影扫过、笔杆晃过、遮挡只持续几帧，不会确认。
+    // 同时维护背景模型的自适应性：
+    //   - 非墨迹像素缓慢吸收光照/阴影的渐变（阴影停留后不再算"新增暗区"）
+    //   - 大面积同步亮度漂移（手进入画面触发自动曝光/对光变化）→ 背景整体平移补偿
     if (!this.age) this.age = new Uint16Array(N);
     const confirmed = new Uint8Array(N);
     let confirmedCount = 0;
+    let sumDiff = 0, diffCnt = 0, bigCnt = 0;  // 非墨迹像素的亮度漂移统计
     for (let py = y0; py < y1; py++) {
       const row = py * pw;
       for (let px = x0; px < x1; px++) {
@@ -274,8 +278,21 @@ export class CameraCapture {
           this.age[idx] = this.age[idx] < CONFIRM_FRAMES ? this.age[idx] + 1 : CONFIRM_FRAMES;
         } else {
           this.age[idx] = 0;
+          const g = gray[idx] - this.bg[idx];
+          sumDiff += g; diffCnt++;
+          if (Math.abs(g) > 0.06) bigCnt++;
+          // 背景慢速自适应（墨迹像素保持原背景，不会被"写进"背景而丢失）
+          this.bg[idx] += 0.02 * g;
         }
         if (this.age[idx] >= CONFIRM_FRAMES) { confirmed[idx] = 1; confirmedCount++; }
+      }
+    }
+    // 曝光突变补偿：过半像素同步亮度漂移 = 曝光跳变（非局部阴影/墨迹），
+    // 背景整体平移后继续识别，不会误报"画面变化过大"或假墨迹
+    if (diffCnt > 0 && bigCnt > diffCnt * 0.5) {
+      const drift = sumDiff / diffCnt;
+      if (Math.abs(drift) > 0.02 && Math.abs(drift) < 0.35) {
+        for (let i = 0; i < N; i++) this.bg[i] += drift;
       }
     }
     if (confirmedCount > this.roiArea * 0.30) {

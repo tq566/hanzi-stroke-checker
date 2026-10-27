@@ -55,9 +55,11 @@ body { max-width: 560px; margin: 0 auto; padding-bottom: 40px; }
 .panel.active { display: block; }
 
 /* ---------- 书写画布 ---------- */
-.canvas-wrap { position: relative; width: 100%; aspect-ratio: 1/1; background: #fff; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
+/* 触屏书写区适当缩小并居中：书写时更容易看到下方的识别结果，
+   周围留白也可正常滑动页面，避免上下滑动时误触书写 */
+.canvas-wrap { position: relative; width: min(76%, 400px); margin: 0 auto; aspect-ratio: 1/1; background: #fff; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.06); }
 .canvas-wrap canvas { width: 100%; height: 100%; display: block; touch-action: none; }
-.canvas-wrap.small { width: 56%; margin: 0 auto; border-radius: 10px; }
+.canvas-wrap.small { width: 56%; border-radius: 10px; }
 
 .progress-line { font-size: 13px; color: var(--muted); padding: 8px 2px; min-height: 20px; }
 

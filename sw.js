@@ -1,7 +1,7 @@
 // sw.js — Service Worker：应用外壳预缓存 + 笔顺分块按需缓存
 // 效果：添加到主屏幕后可离线使用；已写过的字离线依然可练习。
 
-const VERSION = 'hzstroke-v5';
+const VERSION = 'hzstroke-v6';
 const SHELL = [
   './',
   './index.html',
