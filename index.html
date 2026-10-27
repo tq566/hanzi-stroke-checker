@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#2f6fed">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>汉字笔顺智能检查</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<header class="app-header">
+  <div class="brand-row">
+    <div class="brand">汉字笔顺智能检查</div>
+    <button id="btn-qr" class="btn tiny qr-btn" title="扫码使用">📱 扫码</button>
+  </div>
+  <div class="char-row">
+    <label class="char-label">目标字</label>
+    <input id="char-input" maxlength="1" placeholder="输入汉字" autocomplete="off">
+    <div id="char-info" class="char-info"></div>
+  </div>
+  <div id="quick-chips" class="quick-chips"></div>
+</header>
+
+<nav class="mode-tabs">
+  <button class="tab active" data-mode="touch">✍️ 触屏书写</button>
+  <button class="tab" data-mode="camera">📷 摄像头捕捉</button>
+</nav>
+
+<main>
+  <!-- 触屏书写面板 -->
+  <section id="touch-panel" class="panel active">
+    <div class="canvas-wrap">
+      <canvas id="write-canvas" width="1024" height="1024"></canvas>
+    </div>
+    <div class="progress-line" id="progress-line"></div>
+    <div class="btn-row">
+      <button id="btn-undo" class="btn">↩ 撤销</button>
+      <button id="btn-clear" class="btn">🗑 清除</button>
+      <button id="btn-verify" class="btn primary">✔ 校验</button>
+      <button id="btn-demo" class="btn demo">▶ 演示笔顺</button>
+    </div>
+  </section>
+
+  <!-- 摄像头捕捉面板 -->
+  <section id="camera-panel" class="panel">
+    <div class="video-wrap" id="video-wrap">
+      <video id="cam-video" playsinline muted></video>
+      <canvas id="cam-overlay"></canvas>
+      <div class="cam-guide" id="cam-guide"></div>
+      <div class="cam-status" id="cam-status">摄像头未开启</div>
+    </div>
+    <div class="progress-line" id="cam-progress-line"></div>
+    <div class="canvas-wrap small">
+      <canvas id="cam-write-canvas" width="1024" height="1024"></canvas>
+    </div>
+    <div class="btn-row">
+      <button id="btn-cam-start" class="btn primary">开启摄像头</button>
+      <button id="btn-cam-stop" class="btn">停止</button>
+      <button id="btn-cam-color" class="btn">🎯 取笔色</button>
+      <button id="btn-cam-clear" class="btn">清除轨迹</button>
+    </div>
+    <p class="cam-tip">用法：开启摄像头后俯拍白纸，用<b>深色或彩色笔</b>在取景框内书写。点击「取笔色」后，再点按画面中的笔尖进行颜色采样，系统将实时追踪笔尖轨迹并自动切分笔画。书写完毕自动进入校验。</p>
+  </section>
+</main>
+
+<section id="feedback" class="feedback">
+  <div class="feedback-head">
+    <h2>检查结果</h2>
+    <div class="feedback-tools">
+      <label class="toggle"><input type="checkbox" id="opt-voice" checked>语音</label>
+      <label class="toggle"><input type="checkbox" id="opt-ghost" checked>底字</label>
+      <label class="toggle"><input type="checkbox" id="opt-auto" checked>自动校验</label>
+      <select id="opt-strict" title="识别严格度">
+        <option value="1.35">宽松</option>
+        <option value="1" selected>标准</option>
+        <option value="0.8">严格</option>
+      </select>
+      <button id="btn-export" class="btn tiny">导出记录</button>
+    </div>
+  </div>
+  <div id="messages" class="messages"></div>
+</section>
+
+<!-- 标准笔顺演示弹窗 -->
+<div id="animator" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <span id="anim-title">标准笔顺演示</span>
+      <button id="btn-anim-close" class="close">×</button>
+    </div>
+    <div id="anim-stage"></div>
+    <div class="anim-caption" id="anim-caption"></div>
+    <div class="btn-row anim-controls">
+      <button id="btn-anim-replay" class="btn">⏮ 重播</button>
+      <button id="btn-anim-prev" class="btn">◀ 上一笔</button>
+      <button id="btn-anim-play" class="btn primary">⏯ 播放/暂停</button>
+      <button id="btn-anim-next" class="btn">下一笔 ▶</button>
+      <button id="btn-anim-step" class="btn">逐笔模式</button>
+    </div>
+    <div class="anim-progress"><div id="anim-progress-fill"></div></div>
+  </div>
+</div>
+
+<!-- 扫码分享弹窗 -->
+<div id="qr-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <span>扫码使用</span>
+      <button id="btn-qr-close" class="close">×</button>
+    </div>
+    <div class="qr-box">
+      <canvas id="qr-canvas"></canvas>
+      <div id="qr-url" class="qr-url"></div>
+      <p class="cam-tip">手机扫码即可打开本页。若当前地址是 <b>localhost</b>（仅本机可访问），请先用局域网 IP 或公网地址打开页面，再点「扫码」分享。</p>
+    </div>
+  </div>
+</div>
+
+<div id="perf-hud" class="perf-hud"></div>
+<script src="js/vendor/qr.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "汉字笔顺智能检查",
+  "short_name": "笔顺检查",
+  "description": "移动端汉字笔顺实时检查：摄像头/触屏捕捉书写轨迹，逐笔比对标准笔顺，语音纠错与动态演示。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f4f6f8",
+  "theme_color": "#2f6fed",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
