@@ -402,8 +402,7 @@ async function init() {
   // 摄像头按钮
   $('btn-cam-start').addEventListener('click', async () => {
     try {
-      await camera.start();
-      $('cam-status').textContent = '预览中 · 请点「取笔色」→ 再点按画面中的笔尖完成取色；取色成功后才开始识别书写';
+      await camera.start(); // 启动后自动锁定纸面背景（状态由 onStatus 推送）
     } catch (err) {
       $('cam-status').textContent = '无法开启摄像头：' + err.message + '（需 HTTPS 或 localhost 环境）';
     }
@@ -415,19 +414,9 @@ async function init() {
   });
   $('btn-cam-color').addEventListener('click', () => {
     if (!camera.running) { $('cam-status').textContent = '请先开启摄像头'; return; }
-    colorPickArmed = true;
-    $('cam-status').textContent = '请点按画面中的笔尖位置完成取色…';
+    camera.recalibrate();
   });
   $('btn-cam-clear').addEventListener('click', () => { camera.resetTrail(); clearAll(); });
-
-  let colorPickArmed = false;
-  $('cam-video').addEventListener('click', e => {
-    if (!colorPickArmed || !camera.running) return;
-    colorPickArmed = false;
-    const c = camera.sampleColor(e.clientX, e.clientY);
-    $('cam-status').textContent = `已锁定笔色 RGB(${c.r},${c.g},${c.b}) · 轨迹追踪中`;
-    speak('笔色已锁定，请开始书写');
-  });
 
   // 定时刷新摄像头性能 HUD
   setInterval(() => {

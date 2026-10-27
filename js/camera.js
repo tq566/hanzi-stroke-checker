@@ -1,13 +1,20 @@
-// camera.js — 摄像头实时预览与笔尖轨迹追踪
-// 流程：getUserMedia 预览 → rAF 连续帧采集（降采样至 320×240 处理）→
-//       HSV 颜色追踪（需先采样笔色）→ 轨迹平滑/跳变保护 → 抬笔切分 → 回调笔画
-// 注：未采样笔色时不做任何追踪，避免自动对焦/噪点/晃动产生的运动噪声乱画
+// camera.js — 摄像头实时预览与笔迹自动识别
+// 原理：开启后自动锁定纸面背景（画面稳定时拍照记忆灰度），
+//       之后每帧与背景对比：新出现且持续变暗的区域 = 书写墨迹的生长前沿，
+//       其质心即笔尖。黑笔/铅笔/红笔等在白纸上书写均可识别，无需手动取色。
+// 防干扰：新增面积过小(噪点)/过大(手影、纸张移动)/暗化不足(阴影)一律忽略。
 
-const PW = 320, PH = 240;      // 处理分辨率
-const LIFT_FRAMES = 5;         // 连续丢帧数视为抬笔（约 160ms @30fps）
-const MIN_STROKE_PTS = 4;      // 少于该点数视为噪声
-const MIN_PIX = 3;             // 匹配像素数下限
-const JUMP_DIST = PW * 0.35;   // 帧间质心瞬移阈值：超过视为重新落笔（不画飞线）
+const PW = 320, PH = 240;       // 处理分辨率
+const LIFT_FRAMES = 8;           // 连续无新增墨迹帧数视为抬笔（约 260ms @30fps）
+const MIN_STROKE_PTS = 4;       // 少于该点数视为噪声
+const JUMP_DIST = PW * 0.35;     // 帧间质心瞬移阈值：超过视为重新落笔（不画飞线）
+const MIN_PIX = 4;               // 新增墨迹面积下限（像素）
+const MAX_PIX = 2000;            // 新增墨迹面积上限（超过视为阴影/纸张移动）
+const INK_DIFF = 0.16;           // 比背景暗多少算墨迹
+const INK_MAX_GRAY = 0.62;       // 墨迹亮度上限（更亮的区域视为阴影/纸面）
+const TIP_STRONG = 0.22;         // 新增区域平均暗化强度下限（滤弱阴影边缘）
+const LEARN_STABLE_FRAMES = 5;   // 画面连续稳定帧数 → 锁定背景
+const LEARN_TIMEOUT_MS = 6000;   // 最长学习时间（超时强制锁定）
 
 export class CameraCapture {
   constructor(video, overlay, opts) {
@@ -15,16 +22,21 @@ export class CameraCapture {
     this.overlay = overlay;
     this.octx = overlay.getContext('2d');
     this.octx.lineCap = 'round'; this.octx.lineJoin = 'round';
-    this.h = opts; // { onTip(x1024,y1024), onStrokeEnd(points1024), onStatus(text) }
+    this.h = opts; // { onTip(x,y), onStrokeEnd(points), onStatus(text) }
     this.running = false;
     this.stream = null;
-    this.targetColor = null;   // {r,g,b,h,s,v}
     this.trail = [];           // 当前笔画点（视频像素坐标）
     this.lostFrames = 0;
     this.smooth = null;        // 平滑后的笔尖
+    this.jump = false;         // 本帧质心是否瞬移（重新落笔）
+    this.phase = 'idle';       // idle → learning(锁定背景) → ready(识别书写)
+    this.bg = null;            // 背景灰度 Float32Array
+    this.prevInk = null;       // 上一帧墨迹掩膜 Uint8Array
+    this._stableCount = 0;
+    this._learnStart = 0;
+    this._prevLearnGray = null;
     this.frameMs = 0;
     this.fps = 0;
-    this.jump = false;          // 本帧质心是否瞬移（重新落笔）
     this._fpsT = performance.now(); this._fpsC = 0;
     this._proc = document.createElement('canvas');
     this._proc.width = PW; this._proc.height = PH;
@@ -44,6 +56,7 @@ export class CameraCapture {
     this.overlay.height = this.video.videoHeight || 720;
     this.guide = this._guideRect(); // 取景框（映射到 1024×1024 书写坐标系）
     this.running = true;
+    this._beginLearn();          // 自动锁定纸面背景
     this._loop();
   }
 
@@ -53,6 +66,23 @@ export class CameraCapture {
     this.video.srcObject = null;
     this.octx.clearRect(0, 0, this.overlay.width, this.overlay.height);
     this.trail = []; this.smooth = null; this.jump = false;
+    this.phase = 'idle'; this.bg = null; this.prevInk = null;
+    this._prevLearnGray = null; this._stableCount = 0;
+  }
+
+  // 换纸/挪动纸后手动重新校准背景
+  recalibrate() {
+    if (!this.running) return;
+    this.trail = []; this.smooth = null; this.jump = false;
+    this._beginLearn();
+  }
+
+  _beginLearn() {
+    this.phase = 'learning';
+    this.bg = null; this.prevInk = null; this._prevLearnGray = null;
+    this._stableCount = 0;
+    this._learnStart = performance.now();
+    this.h.onStatus('正在锁定纸面背景 · 请移开手，保持纸面稳定…');
   }
 
   // 取景框：视频中央正方形（与 CSS .cam-guide 对应），映射到 1024×1024
@@ -69,20 +99,6 @@ export class CameraCapture {
       Math.max(0, Math.min(1024, (px - g.x) / s * 1024)),
       Math.max(0, Math.min(1024, (py - g.y) / s * 1024))
     ];
-  }
-
-  // 用户点按画面采样笔色
-  sampleColor(clientX, clientY) {
-    const r = this.video.getBoundingClientRect();
-    const sx = (clientX - r.left) / r.width * PW;
-    const sy = (clientY - r.top) / r.height * PH;
-    const img = this._pctx.getImageData(0, 0, PW, PH).data;
-    const idx = (Math.round(sy) * PW + Math.round(sx)) * 4;
-    const rgb = [img[idx], img[idx + 1], img[idx + 2]];
-    const hsv = rgb2hsv(...rgb);
-    this.targetColor = { r: rgb[0], g: rgb[1], b: rgb[2], h: hsv[0], s: hsv[1], v: hsv[2] };
-    this._motionWarned = false;
-    return this.targetColor;
   }
 
   resetTrail() {
@@ -142,17 +158,61 @@ export class CameraCapture {
     return this._pctx.getImageData(0, 0, PW, PH);
   }
 
-  // 笔尖检测：HSV 颜色追踪（必须先采样笔色）。未取色时一律返回 null，
-  // 杜绝把自动对焦/曝光波动/噪点/晃动当作笔尖运动的乱画问题。
+  // 笔迹识别状态机：
+  //   learning — 检测画面稳定性，稳定后拍下背景灰度
+  //   ready    — 每帧找出「新增墨迹」(本帧墨迹且上帧不是墨迹)，质心即笔尖
   _findTip(data) {
-    const tgt = this.targetColor;
-    if (!tgt) { this.smooth = null; return null; }
-    let cx = 0, cy = 0, cnt = 0;
+    const gray = new Float32Array(PW * PH);
     for (let i = 0, px = 0; px < PW * PH; px++, i += 4) {
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-      if (matchColor(r, g, b, tgt)) { cx += px % PW; cy += (px / PW) | 0; cnt++; }
+      gray[px] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) / 255;
     }
-    if (cnt < MIN_PIX) {
+
+    if (this.phase === 'learning') {
+      let changed = 0;
+      if (this._prevLearnGray) {
+        for (let px = 0; px < gray.length; px++) {
+          if (Math.abs(gray[px] - this._prevLearnGray[px]) > 0.12) changed++;
+        }
+      }
+      this._prevLearnGray = gray;
+      this._stableCount = (this._prevLearnGray && changed < PW * PH * 0.008) ? this._stableCount + 1 : 0;
+      if (this._stableCount >= LEARN_STABLE_FRAMES || performance.now() - this._learnStart > LEARN_TIMEOUT_MS) {
+        this.bg = gray; this.prevInk = null; this.phase = 'ready';
+        this.h.onStatus('背景已锁定 · 请直接书写，墨迹自动识别');
+      }
+      return null;
+    }
+
+    if (this.phase !== 'ready' || !this.bg) { this.smooth = null; return null; }
+
+    // pass 1：墨迹掩膜（比背景显著变暗且足够暗）
+    const ink = new Uint8Array(PW * PH);
+    let inkTotal = 0;
+    for (let px = 0; px < gray.length; px++) {
+      if (this.bg[px] - gray[px] > INK_DIFF && gray[px] < INK_MAX_GRAY) { ink[px] = 1; inkTotal++; }
+    }
+    if (inkTotal > PW * PH * 0.30) {
+      // 画面大面积变化：纸张移动/遮挡 → 提示重校准，本帧不识别
+      this.h.onStatus('画面变化过大 · 请点「重新校准」');
+      this.smooth = null; this.prevInk = ink;
+      return null;
+    }
+    // pass 2：新增墨迹（正在生长的笔画前沿）= 本帧墨迹 − 上帧墨迹
+    let cx = 0, cy = 0, cnt = 0, sumd = 0;
+    if (this.prevInk) {
+      for (let py = 0; py < PH; py++) {
+        const row = py * PW;
+        for (let px = 0; px < PW; px++) {
+          const idx = row + px;
+          if (ink[idx] && !this.prevInk[idx]) {
+            cx += px; cy += py; cnt++;
+            sumd += this.bg[idx] - gray[idx];
+          }
+        }
+      }
+    }
+    this.prevInk = ink;
+    if (cnt < MIN_PIX || cnt > MAX_PIX || sumd / cnt < TIP_STRONG) {
       this.smooth = null;
       return null;
     }
@@ -191,28 +251,4 @@ export class CameraCapture {
       c.stroke();
     }
   }
-}
-
-function rgb2hsv(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
-  let h = 0;
-  if (d > 1e-6) {
-    if (mx === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
-    else if (mx === g) h = ((b - r) / d + 3) / 6;
-    else h = ((r - g) / d + 5) / 6;
-  }
-  return [h, mx ? d / mx : 0, mx];
-}
-
-function matchColor(r, g, b, t) {
-  const [h, s, v] = rgb2hsv(r, g, b);
-  if (t.s >= 0.28) {
-    // 彩色笔：以色相为主
-    let dh = Math.abs(h - t.h);
-    if (dh > 0.5) dh = 1 - dh;
-    return dh < 0.085 && s > 0.28 && Math.abs(v - t.v) < 0.45;
-  }
-  // 深色笔（黑/蓝黑）：亮度显著低于纸面
-  return v < 0.35 && s < 0.75 && Math.abs(v - t.v) < 0.22;
 }
